@@ -390,6 +390,9 @@ def _alpr_text_conf(res):
     conf = getattr(ocr, "confidence", 0.0)
     if not text:
         return None, 0.0
+    # fast-alpr gives per-character confidences (a list); reduce to a mean.
+    if isinstance(conf, (list, tuple)):
+        conf = sum(conf) / len(conf) if conf else 0.0
     return text.strip().upper().replace(" ", ""), float(conf or 0.0)
 
 
