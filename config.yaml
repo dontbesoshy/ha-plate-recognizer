@@ -1,9 +1,9 @@
 name: "ha-plate-recognizer"
 version: "0.1.0"
-image: "ghcr.io/pawka/ha-plate-recognizer"
+image: "ghcr.io/dontbesoshy/ha-plate-recognizer"
 slug: "ha-plate-recognizer"
 description: "Detect vehicles with MediaPipe and read license plates via ALPR, published to Home Assistant over MQTT."
-url: "https://github.com/pawka/ha-plate-recognizer"
+url: "https://github.com/dontbesoshy/ha-plate-recognizer"
 startup: application
 boot: auto
 host_network: true  # host network mode; also exposes web_port on the Pi
