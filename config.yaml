@@ -1,5 +1,5 @@
 name: "ha-plate-recognizer"
-version: "0.1.2"
+version: "0.1.3"
 image: "ghcr.io/dontbesoshy/ha-plate-recognizer"
 slug: "ha-plate-recognizer"
 description: "Detect vehicles with MediaPipe and read license plates via ALPR, published to Home Assistant over MQTT."
@@ -32,6 +32,8 @@ options:
   detect_classes: "car"
   min_plate_confidence: 0.5
   alpr_on_no_vehicle: true
+  plate_enhance: true
+  plate_upscale: 3.0
   cooldown: 30
   analyze_interval: 0.4
   enhance_contrast: false
@@ -56,6 +58,8 @@ schema:
   detect_classes: str
   min_plate_confidence: float
   alpr_on_no_vehicle: bool
+  plate_enhance: bool
+  plate_upscale: float
   cooldown: float
   analyze_interval: float
   enhance_contrast: bool

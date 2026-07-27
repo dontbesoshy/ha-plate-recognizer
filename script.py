@@ -55,6 +55,8 @@ else:
         "detect_classes": os.environ.get("DETECT_CLASSES", "car,truck,bus,motorcycle"),
         "min_plate_confidence": float(os.environ.get("MIN_PLATE_CONFIDENCE", "0.5")),
         "alpr_on_no_vehicle": os.environ.get("ALPR_ON_NO_VEHICLE", "true"),
+        "plate_enhance": os.environ.get("PLATE_ENHANCE", "true"),
+        "plate_upscale": float(os.environ.get("PLATE_UPSCALE", "3.0")),
         "cooldown": float(os.environ.get("COOLDOWN", "30")),
         "analyze_interval": float(os.environ.get("ANALYZE_INTERVAL", "0.4")),
         "enhance_contrast": os.environ.get("ENHANCE_CONTRAST", "false"),
@@ -121,6 +123,11 @@ COOLDOWN = float(data.get("cooldown", 30))
 # has its own plate detector, so this catches plates the object detector misses
 # (e.g. a car filling the frame head-on). Costs extra CPU per frame.
 ALPR_ON_NO_VEHICLE = str(data.get("alpr_on_no_vehicle", True)).lower() in ("true", "1", "yes", "on")
+
+# Second-pass OCR: upscale + sharpen just the detected plate crop and re-run the
+# OCR, keeping the higher-confidence reading. Helps small / blurry plates.
+PLATE_ENHANCE = str(data.get("plate_enhance", True)).lower() in ("true", "1", "yes", "on")
+PLATE_UPSCALE = float(data.get("plate_upscale", 3.0))
 
 # Optional CLAHE contrast boost. Helps backlit / uneven-light scenes.
 ENHANCE_CONTRAST = str(data.get("enhance_contrast", False)).lower() in ("true", "1", "yes", "on")
@@ -441,6 +448,23 @@ def _alpr_plate_box(res):
         return None
 
 
+_ocr_clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
+
+
+def enhance_plate(crop):
+    """Upscale + local-contrast + sharpen a plate crop to help the OCR read it."""
+    out = crop
+    if PLATE_UPSCALE and PLATE_UPSCALE > 1.0:
+        out = cv2.resize(out, None, fx=PLATE_UPSCALE, fy=PLATE_UPSCALE,
+                         interpolation=cv2.INTER_CUBIC)
+    lab = cv2.cvtColor(out, cv2.COLOR_BGR2LAB)
+    l, a, b = cv2.split(lab)
+    l = _ocr_clahe.apply(l)
+    out = cv2.cvtColor(cv2.merge((l, a, b)), cv2.COLOR_LAB2BGR)
+    blur = cv2.GaussianBlur(out, (0, 0), 1.0)
+    return cv2.addWeighted(out, 1.6, blur, -0.6, 0)  # unsharp mask
+
+
 # ---------------------------------------------------------------------------
 # Core analysis: ROI + gate + OCR + draw. Shared by the RTSP loop and the web
 # test-upload handler. Returns a JSON-serialisable result dict.
@@ -483,15 +507,35 @@ def analyze(image, publish=True, dedup=True, to_stream=True):
             plate, ocr_conf = _alpr_text_conf(res)
             if not plate:
                 continue
+            pbox = _alpr_plate_box(res)
+
+            # Second pass: enhance + upscale just the plate crop and re-OCR it;
+            # keep the higher-confidence reading. Helps small / blurry plates.
+            plate_crop = None
+            if pbox and PLATE_ENHANCE:
+                px0, py0, px1, py1 = pbox
+                pad = 4
+                pc = region[max(0, py0 - pad):py1 + pad, max(0, px0 - pad):px1 + pad]
+                if pc.size:
+                    plate_crop = enhance_plate(pc)
+                    try:
+                        for r2 in ALPR_ENGINE.predict(plate_crop):
+                            p2, c2 = _alpr_text_conf(r2)
+                            if p2 and c2 > ocr_conf:
+                                plate, ocr_conf = p2, c2
+                    except Exception as e:
+                        logger.info("ALPR enhance error: %s", e)
 
             # Draw plate box (region coords -> ROI coords) + label.
-            pbox = _alpr_plate_box(res)
             if pbox:
                 px0, py0, px1, py1 = pbox
                 cv2.rectangle(display, (x0 + px0, y0 + py0), (x0 + px1, y0 + py1),
                               (0, 200, 255), 2)
-                if inset[0] is None and (py1 - py0) > 4:
-                    inset[0] = region[max(0, py0):py1, max(0, px0):px1].copy()
+                if inset[0] is None:
+                    if plate_crop is not None and plate_crop.size:
+                        inset[0] = plate_crop
+                    elif (py1 - py0) > 4:
+                        inset[0] = region[max(0, py0):py1, max(0, px0):px1].copy()
             cv2.putText(display, "%s (%.2f)" % (plate, ocr_conf),
                         (x0, min(roi_h - 6, y0 + region.shape[0] + 22)),
                         cv2.FONT_HERSHEY_DUPLEX, 0.7, (0, 200, 255), 2, cv2.LINE_AA)
