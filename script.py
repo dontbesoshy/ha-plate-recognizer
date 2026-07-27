@@ -14,6 +14,7 @@ os.environ.setdefault("XDG_CACHE_HOME", "/data/cache")
 os.environ.setdefault("HF_HOME", "/data/cache/huggingface")
 
 import cv2
+import numpy as np
 import mediapipe as mp
 import paho.mqtt.client as mqtt
 from dotenv import load_dotenv
@@ -23,7 +24,7 @@ from mediapipe.tasks import python
 from mediapipe.tasks.python import vision
 
 try:
-    from flask import Flask, Response
+    from flask import Flask, Response, request, jsonify
 except ImportError:
     Flask = None  # web UI simply disabled if flask isn't installed
 
@@ -78,6 +79,7 @@ data = json.loads(json_data)
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
+RTSP_URL = data.get("rtsp_url", "")
 mqtt_broker_address = data.get("mqtt_host")
 mqtt_port = int(data.get("mqtt_port", 1883))
 mqtt_topic = data.get("mqtt_topic", "plate_recognizer/plate")
@@ -116,7 +118,7 @@ COOLDOWN = float(data.get("cooldown", 30))
 # Optional CLAHE contrast boost. Helps backlit / uneven-light scenes.
 ENHANCE_CONTRAST = str(data.get("enhance_contrast", False)).lower() in ("true", "1", "yes", "on")
 
-# Web UI: MJPEG debug preview of what the detector sees.
+# Web UI: MJPEG debug preview + single-image test upload.
 WEB_UI = str(data.get("web_ui", True)).lower() in ("true", "1", "yes", "on")
 WEB_PORT = int(data.get("web_port", 8099))
 
@@ -124,7 +126,38 @@ ANALYZE_INTERVAL = float(data.get("analyze_interval", 0.4))
 
 
 # ---------------------------------------------------------------------------
-# Web preview (MJPEG) — unchanged infra from the original addon.
+# Engines + shared analysis state (module globals so both the RTSP loop and the
+# web upload handler use the same detector/ALPR and dedup state).
+# ---------------------------------------------------------------------------
+DETECTOR = None      # MediaPipe ObjectDetector (vehicle gate)
+ALPR_ENGINE = None   # fast-alpr ALPR (plate detect + OCR)
+_clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)) if ENHANCE_CONTRAST else None
+_plate_last_time = {}  # dedup: plate string -> last publish time
+_state = {"last_plate": "-", "last_plate_ts": 0.0, "fps": 0.0, "prev_cycle_t": 0.0}
+
+
+def build_engines(model):
+    """Create the MediaPipe detector and the fast-alpr engine (once)."""
+    global DETECTOR, ALPR_ENGINE
+    if ALPR is None:
+        raise RuntimeError("fast-alpr not installed. Add it to requirements.txt.")
+    if DETECTOR is None:
+        base_options = python.BaseOptions(model_asset_path=model)
+        options = vision.ObjectDetectorOptions(
+            base_options=base_options,
+            running_mode=vision.RunningMode.IMAGE,
+            score_threshold=MIN_CAR_SCORE,
+            category_allowlist=DETECT_CLASSES,
+        )
+        DETECTOR = vision.ObjectDetector.create_from_options(options)
+    if ALPR_ENGINE is None:
+        logger.info("Loading fast-alpr models (first run downloads weights)...")
+        ALPR_ENGINE = ALPR()  # library defaults: YOLO plate detector + ViT OCR
+        logger.info("fast-alpr ready")
+
+
+# ---------------------------------------------------------------------------
+# Web preview (MJPEG) + single-image test upload.
 # ---------------------------------------------------------------------------
 _web_lock = threading.Lock()
 _web_jpeg = None  # latest annotated JPEG bytes for the web UI
@@ -148,8 +181,27 @@ def set_web_frame(frame_bgr, status_lines):
             _web_jpeg = buf.tobytes()
 
 
+_INDEX_HTML = """<!doctype html><title>Plate recognizer</title>
+<body style="margin:0;background:#111;color:#eee;font-family:sans-serif;text-align:center">
+<h3>ha-plate-recognizer</h3>
+<form id="f" onsubmit="return up(event)">
+  <input type="file" id="img" accept="image/*" required>
+  <button type="submit">Analyze image</button>
+</form>
+<pre id="out" style="color:#0f0;text-align:left;display:inline-block"></pre><br>
+<img src="stream" style="max-width:100%;height:auto">
+<script>
+async function up(e){e.preventDefault();
+ const fd=new FormData(); fd.append('image',document.getElementById('img').files[0]);
+ document.getElementById('out').textContent='analyzing...';
+ const r=await fetch('analyze',{method:'POST',body:fd});
+ document.getElementById('out').textContent=JSON.stringify(await r.json(),null,2);
+ return false;}
+</script></body>"""
+
+
 def start_web_server():
-    """Start the MJPEG preview server in a daemon thread."""
+    """Start the MJPEG preview + test-upload server in a daemon thread."""
     if not WEB_UI or Flask is None:
         logger.info("Web UI disabled (web_ui=%s, flask=%s)", WEB_UI, Flask is not None)
         return
@@ -157,9 +209,7 @@ def start_web_server():
 
     @app.route("/")
     def _index():
-        return ('<!doctype html><title>Plate recognizer</title>'
-                '<body style="margin:0;background:#111;text-align:center">'
-                '<img src="stream" style="max-width:100%;height:auto"></body>')
+        return _INDEX_HTML
 
     @app.route("/stream")
     def _stream():
@@ -171,6 +221,23 @@ def start_web_server():
                     yield (b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + frame + b"\r\n")
                 time.sleep(0.1)
         return Response(gen(), mimetype="multipart/x-mixed-replace; boundary=frame")
+
+    @app.route("/analyze", methods=["POST"])
+    def _analyze():
+        # Test hook: analyze one uploaded image as if it were a camera frame.
+        # Does NOT publish to MQTT and ignores the cooldown, so you can re-test
+        # the same plate repeatedly. The annotated frame appears on /stream.
+        f = request.files.get("image")
+        if f is None:
+            return jsonify({"error": "no 'image' file in form-data"}), 400
+        buf = np.frombuffer(f.read(), np.uint8)
+        img = cv2.imdecode(buf, cv2.IMREAD_COLOR)
+        if img is None:
+            return jsonify({"error": "could not decode image"}), 400
+        if DETECTOR is None or ALPR_ENGINE is None:
+            return jsonify({"error": "engines not ready yet"}), 503
+        result = analyze(img, publish=False, dedup=False)
+        return jsonify(result)
 
     threading.Thread(
         target=lambda: app.run(host="0.0.0.0", port=WEB_PORT, threaded=True),
@@ -186,6 +253,7 @@ def start_web_server():
 # stream and MQTT connection alive. Defaults True so the addon still works if HA
 # never publishes an enable state.
 analysis_enabled = True
+mqtt_connected = False
 
 
 def publish_discovery(client):
@@ -210,7 +278,9 @@ def publish_discovery(client):
 
 
 def on_connect(client, userdata, flags, rc):
+    global mqtt_connected
     if rc == 0:
+        mqtt_connected = True
         logger.info("Connected to MQTT Broker")
         client.subscribe(mqtt_enable_topic)
         logger.info("Subscribed to enable topic: %s", mqtt_enable_topic)
@@ -234,12 +304,20 @@ client = mqtt.Client()
 client.username_pw_set(username=mqtt_username, password=mqtt_password)
 client.on_connect = on_connect
 client.on_message = on_message
-client.connect(mqtt_broker_address, mqtt_port, 60)
+# Resilient connect: a missing/unreachable broker must not crash the addon
+# (e.g. standalone image testing without MQTT). The client keeps retrying.
+try:
+    client.connect(mqtt_broker_address, mqtt_port, 60)
+except Exception as e:
+    logger.info("MQTT connect failed (%s); continuing without MQTT", e)
 client.loop_start()
 
 
 def publish_plate(plate, ocr_conf, vehicle_class, detect_score):
     """Publish the plate to the state topic (+ raw topic) with JSON attributes."""
+    if not mqtt_connected:
+        logger.info("PLATE %s (not published - MQTT not connected)", plate)
+        return
     attrs = {
         "confidence": round(float(ocr_conf), 3),
         "vehicle_class": vehicle_class,
@@ -328,42 +406,141 @@ def _alpr_plate_box(res):
 
 
 # ---------------------------------------------------------------------------
+# Core analysis: ROI + gate + OCR + draw. Shared by the RTSP loop and the web
+# test-upload handler. Returns a JSON-serialisable result dict.
+# ---------------------------------------------------------------------------
+def analyze(image, publish=True, dedup=True):
+    # ROI crop.
+    if ROI_ENABLED:
+        h, w = image.shape[:2]
+        image = image[int(ROI_TOP * h):int(ROI_BOTTOM * h),
+                      int(ROI_LEFT * w):int(ROI_RIGHT * w)]
+
+    # Optional contrast boost on the L channel.
+    if _clahe is not None:
+        lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
+        l, a, b = cv2.split(lab)
+        l = _clahe.apply(l)
+        image = cv2.cvtColor(cv2.merge((l, a, b)), cv2.COLOR_LAB2BGR)
+
+    roi_h, roi_w = image.shape[:2]
+    display = image.copy()
+    ts = time.time()
+
+    # --- Gate: detect vehicles ---
+    rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+    det_result = DETECTOR.detect(mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb))
+    vehicles = det_result.detections or []
+
+    plate_inset = None
+    plates = []
+
+    for det in vehicles:
+        bb = det.bounding_box
+        x0 = max(0, bb.origin_x)
+        y0 = max(0, bb.origin_y)
+        x1 = min(roi_w, bb.origin_x + bb.width)
+        y1 = min(roi_h, bb.origin_y + bb.height)
+        cat = det.categories[0]
+        vscore = cat.score
+        vclass = cat.category_name
+
+        cv2.rectangle(display, (x0, y0), (x1, y1), (0, 255, 0), 2)
+        cv2.putText(display, "%s %.2f" % (vclass, vscore), (x0, max(14, y0 - 6)),
+                    cv2.FONT_HERSHEY_DUPLEX, 0.6, (0, 255, 0), 2, cv2.LINE_AA)
+
+        if x1 <= x0 or y1 <= y0:
+            continue
+        crop = image[y0:y1, x0:x1]
+
+        # --- OCR the vehicle crop ---
+        try:
+            results = ALPR_ENGINE.predict(crop)
+        except Exception as e:
+            logger.info("ALPR error: %s", e)
+            continue
+
+        for res in results:
+            plate, ocr_conf = _alpr_text_conf(res)
+            if not plate:
+                continue
+
+            # Draw plate box (crop coords -> ROI coords) + label.
+            pbox = _alpr_plate_box(res)
+            if pbox:
+                px0, py0, px1, py1 = pbox
+                cv2.rectangle(display, (x0 + px0, y0 + py0), (x0 + px1, y0 + py1),
+                              (0, 200, 255), 2)
+                ph = max(1, min(py1, crop.shape[0]) - max(0, py0))
+                if plate_inset is None and ph > 4:
+                    plate_inset = crop[max(0, py0):py1, max(0, px0):px1].copy()
+            cv2.putText(display, "%s (%.2f)" % (plate, ocr_conf),
+                        (x0, min(roi_h - 6, y1 + 22)),
+                        cv2.FONT_HERSHEY_DUPLEX, 0.7, (0, 200, 255), 2, cv2.LINE_AA)
+
+            accepted = ocr_conf >= MIN_PLATE_CONFIDENCE
+            published = False
+            if accepted and publish:
+                if not dedup or ts - _plate_last_time.get(plate, 0.0) >= COOLDOWN:
+                    publish_plate(plate, ocr_conf, vclass, vscore)
+                    _plate_last_time[plate] = ts
+                    _state["last_plate"] = plate
+                    _state["last_plate_ts"] = ts
+                    published = True
+
+            plates.append({
+                "plate": plate,
+                "ocr_confidence": round(ocr_conf, 3),
+                "vehicle_class": vclass,
+                "detect_score": round(float(vscore), 3),
+                "accepted": accepted,
+                "published": published,
+            })
+
+    diag = "ok" if plates else ("vehicle_no_plate" if vehicles else "no_vehicle")
+
+    # FPS for the overlay.
+    _state["fps"] = 1.0 / max(1e-3, ts - _state["prev_cycle_t"])
+    _state["prev_cycle_t"] = ts
+
+    # Plate crop inset (top-right) so OCR input is visible.
+    if plate_inset is not None and plate_inset.size:
+        ih = 60
+        scale = ih / max(1, plate_inset.shape[0])
+        iw = max(1, int(plate_inset.shape[1] * scale))
+        iw = min(iw, roi_w - 4)
+        try:
+            thumb = cv2.resize(plate_inset, (iw, ih))
+            display[4:4 + ih, roi_w - iw - 4:roi_w - 4] = thumb
+            cv2.rectangle(display, (roi_w - iw - 4, 4), (roi_w - 4, 4 + ih), (0, 200, 255), 1)
+        except Exception:
+            pass
+
+    cd_left = max(0.0, COOLDOWN - (ts - _state["last_plate_ts"])) if _state["last_plate"] != "-" else 0.0
+    set_web_frame(display, [
+        "FPS %.1f  analysis %s  diag %s" % (_state["fps"], "ON" if analysis_enabled else "OFF", diag),
+        "last plate %s  cooldown %.0fs" % (_state["last_plate"], cd_left),
+        "ROI x %.2f-%.2f y %.2f-%.2f" % (ROI_LEFT, ROI_RIGHT, ROI_TOP, ROI_BOTTOM),
+    ])
+
+    return {"diag": diag, "vehicles": len(vehicles), "plates": plates}
+
+
+# ---------------------------------------------------------------------------
 # Main loop
 # ---------------------------------------------------------------------------
 def run(model: str) -> None:
-    if ALPR is None:
-        raise RuntimeError("fast-alpr not installed. Add it to requirements.txt.")
+    build_engines(model)
 
-    grabber = FrameGrabber(data.get("rtsp_url"))
+    if not RTSP_URL:
+        # Mock / test mode: no camera. Serve the web UI and wait for image
+        # uploads on /analyze. Keeps the process alive.
+        logger.info("No rtsp_url set -> mock mode. Upload an image at http://<host>:%d", WEB_PORT)
+        while True:
+            time.sleep(1.0)
 
-    # MediaPipe object detector = the vehicle gate. IMAGE mode: synchronous
-    # detect() returns the result directly.
-    base_options = python.BaseOptions(model_asset_path=model)
-    options = vision.ObjectDetectorOptions(
-        base_options=base_options,
-        running_mode=vision.RunningMode.IMAGE,
-        score_threshold=MIN_CAR_SCORE,
-        category_allowlist=DETECT_CLASSES,
-    )
-    detector = vision.ObjectDetector.create_from_options(options)
-
-    # Local ALPR (plate detect + OCR). Weights are downloaded to XDG_CACHE_HOME
-    # (=/data/cache) on first run.
-    logger.info("Loading fast-alpr models (first run downloads weights)...")
-    alpr = ALPR()  # library defaults: YOLO plate detector + ViT OCR
-    logger.info("fast-alpr ready")
-
-    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)) if ENHANCE_CONTRAST else None
-
-    # Dedup state: last time each plate string was published.
-    plate_last_time = {}
-
+    grabber = FrameGrabber(RTSP_URL)
     last_analysis = 0.0
-    prev_cycle_t = 0.0
-    fps = 0.0
-    last_plate = "-"
-    last_plate_ts = 0.0
-    diag = "startup"
 
     while True:
         if not analysis_enabled:
@@ -381,115 +558,8 @@ def run(model: str) -> None:
             time.sleep(0.05)
             continue
 
-        # ROI crop.
-        if ROI_ENABLED:
-            h, w = image.shape[:2]
-            image = image[int(ROI_TOP * h):int(ROI_BOTTOM * h),
-                          int(ROI_LEFT * w):int(ROI_RIGHT * w)]
+        analyze(image, publish=True, dedup=True)
 
-        # Optional contrast boost on the L channel.
-        if clahe is not None:
-            lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
-            l, a, b = cv2.split(lab)
-            l = clahe.apply(l)
-            image = cv2.cvtColor(cv2.merge((l, a, b)), cv2.COLOR_LAB2BGR)
-
-        roi_h, roi_w = image.shape[:2]
-        display = image.copy()
-        ts = time.time()
-
-        # --- Gate: detect vehicles ---
-        rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-        det_result = detector.detect(mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb))
-        vehicles = det_result.detections or []
-
-        plate_inset = None
-        found_plate = False
-
-        for det in vehicles:
-            bb = det.bounding_box
-            x0 = max(0, bb.origin_x)
-            y0 = max(0, bb.origin_y)
-            x1 = min(roi_w, bb.origin_x + bb.width)
-            y1 = min(roi_h, bb.origin_y + bb.height)
-            cat = det.categories[0]
-            vscore = cat.score
-            vclass = cat.category_name
-
-            cv2.rectangle(display, (x0, y0), (x1, y1), (0, 255, 0), 2)
-            cv2.putText(display, "%s %.2f" % (vclass, vscore), (x0, max(14, y0 - 6)),
-                        cv2.FONT_HERSHEY_DUPLEX, 0.6, (0, 255, 0), 2, cv2.LINE_AA)
-
-            if x1 <= x0 or y1 <= y0:
-                continue
-            crop = image[y0:y1, x0:x1]
-
-            # --- OCR the vehicle crop ---
-            try:
-                results = alpr.predict(crop)
-            except Exception as e:
-                logger.info("ALPR error: %s", e)
-                continue
-
-            for res in results:
-                plate, ocr_conf = _alpr_text_conf(res)
-                if not plate:
-                    continue
-
-                # Draw plate box (crop coords -> ROI coords) + label.
-                pbox = _alpr_plate_box(res)
-                if pbox:
-                    px0, py0, px1, py1 = pbox
-                    cv2.rectangle(display, (x0 + px0, y0 + py0), (x0 + px1, y0 + py1),
-                                  (0, 200, 255), 2)
-                    ph = max(1, min(py1, crop.shape[0]) - max(0, py0))
-                    if plate_inset is None and ph > 4:
-                        plate_inset = crop[max(0, py0):py1, max(0, px0):px1].copy()
-                cv2.putText(display, "%s (%.2f)" % (plate, ocr_conf),
-                            (x0, min(roi_h - 6, y1 + 22)),
-                            cv2.FONT_HERSHEY_DUPLEX, 0.7, (0, 200, 255), 2, cv2.LINE_AA)
-
-                found_plate = True
-                if ocr_conf < MIN_PLATE_CONFIDENCE:
-                    continue
-
-                # Dedup by plate within COOLDOWN.
-                if ts - plate_last_time.get(plate, 0.0) >= COOLDOWN:
-                    publish_plate(plate, ocr_conf, vclass, vscore)
-                    plate_last_time[plate] = ts
-                    last_plate = plate
-                    last_plate_ts = ts
-
-        # Analyse-rate FPS.
-        fps = 1.0 / max(1e-3, ts - prev_cycle_t)
-        prev_cycle_t = ts
-
-        new_diag = "ok" if found_plate else ("vehicle_no_plate" if vehicles else "no_vehicle")
-        if new_diag != diag:
-            logger.info("diag: %s", new_diag)
-            diag = new_diag
-
-        # Plate crop inset (top-right) so OCR input is visible.
-        if plate_inset is not None and plate_inset.size:
-            ih = 60
-            scale = ih / max(1, plate_inset.shape[0])
-            iw = max(1, int(plate_inset.shape[1] * scale))
-            iw = min(iw, roi_w - 4)
-            try:
-                thumb = cv2.resize(plate_inset, (iw, ih))
-                display[4:4 + ih, roi_w - iw - 4:roi_w - 4] = thumb
-                cv2.rectangle(display, (roi_w - iw - 4, 4), (roi_w - 4, 4 + ih), (0, 200, 255), 1)
-            except Exception:
-                pass
-
-        cd_left = max(0.0, COOLDOWN - (ts - last_plate_ts)) if last_plate != "-" else 0.0
-        set_web_frame(display, [
-            "FPS %.1f  analysis %s  diag %s" % (fps, "ON" if analysis_enabled else "OFF", diag),
-            "last plate %s  cooldown %.0fs" % (last_plate, cd_left),
-            "ROI x %.2f-%.2f y %.2f-%.2f" % (ROI_LEFT, ROI_RIGHT, ROI_TOP, ROI_BOTTOM),
-        ])
-
-    detector.close()
     grabber.release()
 
 
@@ -501,7 +571,23 @@ def main():
         help='Path to the MediaPipe object-detection model (.tflite).',
         required=False,
         default='efficientdet_lite0.tflite')
+    parser.add_argument(
+        '--image',
+        help='Analyze a single local image, print JSON, and exit (offline test).',
+        required=False,
+        default=None)
     args = parser.parse_args()
+
+    if args.image:
+        # Pure offline test: no camera, no MQTT publish.
+        build_engines(args.model)
+        img = cv2.imread(args.image)
+        if img is None:
+            logger.error("Could not read image: %s", args.image)
+            sys.exit(1)
+        result = analyze(img, publish=False, dedup=False)
+        print(json.dumps(result, indent=2))
+        return
 
     start_web_server()
     run(args.model)

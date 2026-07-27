@@ -65,6 +65,33 @@ pip install -r requirements.txt
 python script.py          # --model efficientdet_lite0.tflite
 ```
 
+## Testing without a camera
+
+You don't need the RTSP stream (or an MQTT broker) to test the recognition
+pipeline — feed it a still photo instead.
+
+**A) Upload via the web UI.** Leave `rtsp_url` empty (mock mode) or keep the
+stream running, open `http://<host>:8099`, pick an image and click *Analyze
+image*. The pipeline runs on that single frame; the annotated result appears in
+the preview and the JSON detection (`diag`, `vehicles`, `plates[]` with
+per-plate `ocr_confidence`/`accepted`) is shown on the page. Uploads never
+publish to MQTT and ignore the cooldown, so you can re-test the same plate.
+
+```bash
+# same thing from the shell:
+curl -F image=@car.jpg http://localhost:8099/analyze
+```
+
+**B) One-shot CLI.** Analyze a local file, print JSON, and exit — no camera, no
+MQTT:
+
+```bash
+python script.py --image car.jpg
+```
+
+The MQTT connection is best-effort: an unreachable broker logs a warning and the
+addon keeps running, so image testing works fully offline.
+
 ## Notes
 
 - Tune `analyze_interval` if the Pi can't keep up; the MediaPipe gate already avoids
