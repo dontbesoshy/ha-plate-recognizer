@@ -1,0 +1,65 @@
+name: "ha-plate-recognizer"
+version: "0.1.0"
+image: "ghcr.io/pawka/ha-plate-recognizer"
+slug: "ha-plate-recognizer"
+description: "Detect vehicles with MediaPipe and read license plates via ALPR, published to Home Assistant over MQTT."
+url: "https://github.com/pawka/ha-plate-recognizer"
+startup: application
+boot: auto
+host_network: true  # host network mode; also exposes web_port on the Pi
+docker:
+  privileged: true
+  restart: always
+  network_mode: host
+init: false
+arch:
+  - aarch64
+map:
+  - config:rw
+  - ssl
+
+options:
+  rtsp_url: rtsp://192.168.5.3:8554/camera
+  mqtt_host: 192.168.5.3
+  mqtt_port: 1883
+  mqtt_username: user
+  mqtt_password: null
+  mqtt_topic: "plate_recognizer/plate"
+  mqtt_enable_topic: "plate_recognizer_enable"
+  mqtt_discovery: true
+  device_name: "ha-plate-recognizer"
+  min_car_score: 0.4
+  detect_classes: "car,truck,bus,motorcycle"
+  min_plate_confidence: 0.5
+  cooldown: 30
+  analyze_interval: 0.4
+  enhance_contrast: false
+  web_ui: true
+  web_port: 8099
+  roi_top: 0.0
+  roi_bottom: 1.0
+  roi_left: 0.0
+  roi_right: 1.0
+
+schema:
+  rtsp_url: str
+  mqtt_host: str
+  mqtt_port: int
+  mqtt_username: str
+  mqtt_password: password
+  mqtt_topic: str
+  mqtt_enable_topic: str
+  mqtt_discovery: bool
+  device_name: str
+  min_car_score: float
+  detect_classes: str
+  min_plate_confidence: float
+  cooldown: float
+  analyze_interval: float
+  enhance_contrast: bool
+  web_ui: bool
+  web_port: int
+  roi_top: float
+  roi_bottom: float
+  roi_left: float
+  roi_right: float

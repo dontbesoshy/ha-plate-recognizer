@@ -1,0 +1,6 @@
+opencv-python-headless==4.10.0.84
+mediapipe==0.10.14
+paho-mqtt==1.5.0
+python-dotenv==1.0.1
+flask==3.0.3
+fast-alpr==0.4.0
