@@ -1,5 +1,5 @@
 name: "ha-plate-recognizer"
-version: "0.1.0"
+version: "0.1.1"
 image: "ghcr.io/dontbesoshy/ha-plate-recognizer"
 slug: "ha-plate-recognizer"
 description: "Detect vehicles with MediaPipe and read license plates via ALPR, published to Home Assistant over MQTT."
@@ -19,24 +19,24 @@ map:
   - ssl
 
 options:
-  rtsp_url: rtsp://192.168.5.3:8554/camera
-  mqtt_host: 192.168.5.3
+  rtsp_url: rtsp://192.168.1.199:8554/bramaRtsp
+  mqtt_host: 192.168.1.199
   mqtt_port: 1883
-  mqtt_username: user
+  mqtt_username: pawel
   mqtt_password: null
   mqtt_topic: "plate_recognizer/plate"
   mqtt_enable_topic: "plate_recognizer_enable"
   mqtt_discovery: true
   device_name: "ha-plate-recognizer"
   min_car_score: 0.4
-  detect_classes: "car,truck,bus,motorcycle"
+  detect_classes: "car"
   min_plate_confidence: 0.5
   cooldown: 30
   analyze_interval: 0.4
   enhance_contrast: false
   web_ui: true
   web_port: 8099
-  roi_top: 0.0
+  roi_top: 0.5
   roi_bottom: 1.0
   roi_left: 0.0
   roi_right: 1.0

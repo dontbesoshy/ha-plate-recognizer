@@ -27,6 +27,8 @@ jobs:
       - name: Build and push arm64 image
         run: |
           IMG=ghcr.io/dontbesoshy/ha-plate-recognizer
-          docker build -t $IMG:0.1.0 -t $IMG:latest .
-          docker push $IMG:0.1.0
+          VER=$(grep '^version:' config.yaml | sed -E 's/version:[[:space:]]*"?([^"]+)"?/\1/')
+          echo "Building version $VER"
+          docker build -t $IMG:$VER -t $IMG:latest .
+          docker push $IMG:$VER
           docker push $IMG:latest
