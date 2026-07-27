@@ -10,8 +10,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /app
 
 # MediaPipe object-detection model (COCO, includes car/truck/bus/motorcycle).
-RUN wget -qO efficientdet_lite0.tflite \
-    https://storage.googleapis.com/mediapipe-models/object_detector/efficientdet_lite0/int8/1/efficientdet_lite0.tflite
+# Lite2 float32: more accurate than the int8 lite0 (better on head-on cars).
+RUN wget -qO efficientdet_lite2.tflite \
+    https://storage.googleapis.com/mediapipe-models/object_detector/efficientdet_lite2/float32/1/efficientdet_lite2.tflite
 
 # Copy the current directory contents into the container at /app
 COPY . /app

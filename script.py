@@ -1,4 +1,5 @@
 import argparse
+import base64
 import sys
 import time
 import json
@@ -53,6 +54,7 @@ else:
         "min_car_score": float(os.environ.get("MIN_CAR_SCORE", "0.4")),
         "detect_classes": os.environ.get("DETECT_CLASSES", "car,truck,bus,motorcycle"),
         "min_plate_confidence": float(os.environ.get("MIN_PLATE_CONFIDENCE", "0.5")),
+        "alpr_on_no_vehicle": os.environ.get("ALPR_ON_NO_VEHICLE", "true"),
         "cooldown": float(os.environ.get("COOLDOWN", "30")),
         "analyze_interval": float(os.environ.get("ANALYZE_INTERVAL", "0.4")),
         "enhance_contrast": os.environ.get("ENHANCE_CONTRAST", "false"),
@@ -115,6 +117,11 @@ DETECT_CLASSES = [c.strip() for c in str(data.get("detect_classes", "car,truck,b
 MIN_PLATE_CONFIDENCE = float(data.get("min_plate_confidence", 0.5))
 COOLDOWN = float(data.get("cooldown", 30))
 
+# When the vehicle gate finds nothing, still run ALPR on the whole ROI. fast-alpr
+# has its own plate detector, so this catches plates the object detector misses
+# (e.g. a car filling the frame head-on). Costs extra CPU per frame.
+ALPR_ON_NO_VEHICLE = str(data.get("alpr_on_no_vehicle", True)).lower() in ("true", "1", "yes", "on")
+
 # Optional CLAHE contrast boost. Helps backlit / uneven-light scenes.
 ENHANCE_CONTRAST = str(data.get("enhance_contrast", False)).lower() in ("true", "1", "yes", "on")
 
@@ -163,11 +170,8 @@ _web_lock = threading.Lock()
 _web_jpeg = None  # latest annotated JPEG bytes for the web UI
 
 
-def set_web_frame(frame_bgr, status_lines):
-    """Overlay status text, JPEG-encode, and stash for the web stream."""
-    global _web_jpeg
-    if not WEB_UI or Flask is None or frame_bgr is None:
-        return
+def overlay_status(frame_bgr, status_lines):
+    """Bake status text into a copy of the frame and return it."""
     disp = frame_bgr.copy()
     y = 22
     for line in status_lines:
@@ -175,10 +179,24 @@ def set_web_frame(frame_bgr, status_lines):
         cv2.putText(disp, line, (8, y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 3, cv2.LINE_AA)
         cv2.putText(disp, line, (8, y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 1, cv2.LINE_AA)
         y += 24
-    ok, buf = cv2.imencode(".jpg", disp, [cv2.IMWRITE_JPEG_QUALITY, 70])
-    if ok:
+    return disp
+
+
+def encode_jpeg(frame_bgr):
+    """JPEG-encode a frame -> bytes, or None."""
+    ok, buf = cv2.imencode(".jpg", frame_bgr, [cv2.IMWRITE_JPEG_QUALITY, 70])
+    return buf.tobytes() if ok else None
+
+
+def store_web_frame(frame_bgr):
+    """Stash an already-annotated frame for the live MJPEG stream."""
+    global _web_jpeg
+    if not WEB_UI or Flask is None or frame_bgr is None:
+        return
+    jpg = encode_jpeg(frame_bgr)
+    if jpg is not None:
         with _web_lock:
-            _web_jpeg = buf.tobytes()
+            _web_jpeg = jpg
 
 
 _INDEX_HTML = """<!doctype html><title>Plate recognizer</title>
@@ -187,15 +205,27 @@ _INDEX_HTML = """<!doctype html><title>Plate recognizer</title>
 <form id="f" onsubmit="return up(event)">
   <input type="file" id="img" accept="image/*" required>
   <button type="submit">Analyze image</button>
+  <button type="button" onclick="clearRes()">Back to live</button>
 </form>
-<pre id="out" style="color:#0f0;text-align:left;display:inline-block"></pre><br>
-<img src="stream" style="max-width:100%;height:auto">
+<div id="result" style="display:none">
+  <h4>Analyzed image (stays until you upload again)</h4>
+  <img id="rimg" style="max-width:100%;height:auto"><br>
+  <pre id="out" style="color:#0f0;text-align:left;display:inline-block"></pre>
+</div>
+<div id="live"><h4>Live stream</h4>
+  <img src="stream" style="max-width:100%;height:auto"></div>
 <script>
+function clearRes(){document.getElementById('result').style.display='none';
+ document.getElementById('live').style.display='block';}
 async function up(e){e.preventDefault();
  const fd=new FormData(); fd.append('image',document.getElementById('img').files[0]);
+ document.getElementById('result').style.display='block';
+ document.getElementById('live').style.display='none';
  document.getElementById('out').textContent='analyzing...';
  const r=await fetch('analyze',{method:'POST',body:fd});
- document.getElementById('out').textContent=JSON.stringify(await r.json(),null,2);
+ const j=await r.json();
+ if(j.image){document.getElementById('rimg').src=j.image; delete j.image;}
+ document.getElementById('out').textContent=JSON.stringify(j,null,2);
  return false;}
 </script></body>"""
 
@@ -236,7 +266,10 @@ def start_web_server():
             return jsonify({"error": "could not decode image"}), 400
         if DETECTOR is None or ALPR_ENGINE is None:
             return jsonify({"error": "engines not ready yet"}), 503
-        result = analyze(img, publish=False, dedup=False)
+        result, annotated = analyze(img, publish=False, dedup=False, to_stream=False)
+        jpg = encode_jpeg(annotated)
+        if jpg is not None:
+            result["image"] = "data:image/jpeg;base64," + base64.b64encode(jpg).decode()
         return jsonify(result)
 
     threading.Thread(
@@ -412,7 +445,14 @@ def _alpr_plate_box(res):
 # Core analysis: ROI + gate + OCR + draw. Shared by the RTSP loop and the web
 # test-upload handler. Returns a JSON-serialisable result dict.
 # ---------------------------------------------------------------------------
-def analyze(image, publish=True, dedup=True):
+def analyze(image, publish=True, dedup=True, to_stream=True):
+    """Run the full pipeline on one BGR frame.
+
+    Returns (result_dict, annotated_bgr). The annotated frame is also pushed to
+    the live MJPEG stream when to_stream=True (the RTSP loop); web uploads pass
+    to_stream=False so a single analysed image can be shown on its own without
+    the live stream overwriting it a moment later.
+    """
     # ROI crop.
     if ROI_ENABLED:
         h, w = image.shape[:2]
@@ -429,67 +469,41 @@ def analyze(image, publish=True, dedup=True):
     roi_h, roi_w = image.shape[:2]
     display = image.copy()
     ts = time.time()
-
-    # --- Gate: detect vehicles ---
-    rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-    det_result = DETECTOR.detect(mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb))
-    vehicles = det_result.detections or []
-
-    plate_inset = None
     plates = []
+    inset = [None]  # mutable holder for the first plate crop (for the preview)
 
-    for det in vehicles:
-        bb = det.bounding_box
-        x0 = max(0, bb.origin_x)
-        y0 = max(0, bb.origin_y)
-        x1 = min(roi_w, bb.origin_x + bb.width)
-        y1 = min(roi_h, bb.origin_y + bb.height)
-        cat = det.categories[0]
-        vscore = cat.score
-        vclass = cat.category_name
-
-        cv2.rectangle(display, (x0, y0), (x1, y1), (0, 255, 0), 2)
-        cv2.putText(display, "%s %.2f" % (vclass, vscore), (x0, max(14, y0 - 6)),
-                    cv2.FONT_HERSHEY_DUPLEX, 0.6, (0, 255, 0), 2, cv2.LINE_AA)
-
-        if x1 <= x0 or y1 <= y0:
-            continue
-        crop = image[y0:y1, x0:x1]
-
-        # --- OCR the vehicle crop ---
+    def ocr_region(x0, y0, region, vclass, vscore):
+        """Run ALPR on a sub-image at (x0,y0); draw + collect any plates."""
         try:
-            results = ALPR_ENGINE.predict(crop)
+            results = ALPR_ENGINE.predict(region)
         except Exception as e:
             logger.info("ALPR error: %s", e)
-            continue
-
+            return
         for res in results:
             plate, ocr_conf = _alpr_text_conf(res)
             if not plate:
                 continue
 
-            # Draw plate box (crop coords -> ROI coords) + label.
+            # Draw plate box (region coords -> ROI coords) + label.
             pbox = _alpr_plate_box(res)
             if pbox:
                 px0, py0, px1, py1 = pbox
                 cv2.rectangle(display, (x0 + px0, y0 + py0), (x0 + px1, y0 + py1),
                               (0, 200, 255), 2)
-                ph = max(1, min(py1, crop.shape[0]) - max(0, py0))
-                if plate_inset is None and ph > 4:
-                    plate_inset = crop[max(0, py0):py1, max(0, px0):px1].copy()
+                if inset[0] is None and (py1 - py0) > 4:
+                    inset[0] = region[max(0, py0):py1, max(0, px0):px1].copy()
             cv2.putText(display, "%s (%.2f)" % (plate, ocr_conf),
-                        (x0, min(roi_h - 6, y1 + 22)),
+                        (x0, min(roi_h - 6, y0 + region.shape[0] + 22)),
                         cv2.FONT_HERSHEY_DUPLEX, 0.7, (0, 200, 255), 2, cv2.LINE_AA)
 
             accepted = ocr_conf >= MIN_PLATE_CONFIDENCE
             published = False
-            if accepted and publish:
-                if not dedup or ts - _plate_last_time.get(plate, 0.0) >= COOLDOWN:
-                    publish_plate(plate, ocr_conf, vclass, vscore)
-                    _plate_last_time[plate] = ts
-                    _state["last_plate"] = plate
-                    _state["last_plate_ts"] = ts
-                    published = True
+            if accepted and publish and (not dedup or ts - _plate_last_time.get(plate, 0.0) >= COOLDOWN):
+                publish_plate(plate, ocr_conf, vclass, vscore)
+                _plate_last_time[plate] = ts
+                _state["last_plate"] = plate
+                _state["last_plate_ts"] = ts
+                published = True
 
             plates.append({
                 "plate": plate,
@@ -500,33 +514,64 @@ def analyze(image, publish=True, dedup=True):
                 "published": published,
             })
 
-    diag = "ok" if plates else ("vehicle_no_plate" if vehicles else "no_vehicle")
+    # --- Gate: detect vehicles ---
+    rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+    det_result = DETECTOR.detect(mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb))
+    vehicles = det_result.detections or []
+
+    for det in vehicles:
+        bb = det.bounding_box
+        x0 = max(0, bb.origin_x)
+        y0 = max(0, bb.origin_y)
+        x1 = min(roi_w, bb.origin_x + bb.width)
+        y1 = min(roi_h, bb.origin_y + bb.height)
+        cat = det.categories[0]
+        cv2.rectangle(display, (x0, y0), (x1, y1), (0, 255, 0), 2)
+        cv2.putText(display, "%s %.2f" % (cat.category_name, cat.score), (x0, max(14, y0 - 6)),
+                    cv2.FONT_HERSHEY_DUPLEX, 0.6, (0, 255, 0), 2, cv2.LINE_AA)
+        if x1 > x0 and y1 > y0:
+            ocr_region(x0, y0, image[y0:y1, x0:x1], cat.category_name, cat.score)
+
+    # Fallback: the gate found nothing but a plate may still be readable (car
+    # filling the frame head-on). Run ALPR on the whole ROI.
+    fallback = False
+    if not vehicles and ALPR_ON_NO_VEHICLE:
+        fallback = True
+        ocr_region(0, 0, image, "frame", 0.0)
+
+    if plates:
+        diag = "ok_fallback" if fallback else "ok"
+    elif vehicles:
+        diag = "vehicle_no_plate"
+    else:
+        diag = "no_vehicle"
 
     # FPS for the overlay.
     _state["fps"] = 1.0 / max(1e-3, ts - _state["prev_cycle_t"])
     _state["prev_cycle_t"] = ts
 
     # Plate crop inset (top-right) so OCR input is visible.
-    if plate_inset is not None and plate_inset.size:
+    if inset[0] is not None and inset[0].size:
         ih = 60
-        scale = ih / max(1, plate_inset.shape[0])
-        iw = max(1, int(plate_inset.shape[1] * scale))
-        iw = min(iw, roi_w - 4)
+        scale = ih / max(1, inset[0].shape[0])
+        iw = min(max(1, int(inset[0].shape[1] * scale)), roi_w - 4)
         try:
-            thumb = cv2.resize(plate_inset, (iw, ih))
-            display[4:4 + ih, roi_w - iw - 4:roi_w - 4] = thumb
+            display[4:4 + ih, roi_w - iw - 4:roi_w - 4] = cv2.resize(inset[0], (iw, ih))
             cv2.rectangle(display, (roi_w - iw - 4, 4), (roi_w - 4, 4 + ih), (0, 200, 255), 1)
         except Exception:
             pass
 
     cd_left = max(0.0, COOLDOWN - (ts - _state["last_plate_ts"])) if _state["last_plate"] != "-" else 0.0
-    set_web_frame(display, [
+    display = overlay_status(display, [
         "FPS %.1f  analysis %s  diag %s" % (_state["fps"], "ON" if analysis_enabled else "OFF", diag),
-        "last plate %s  cooldown %.0fs" % (_state["last_plate"], cd_left),
+        "vehicles %d  last plate %s  cooldown %.0fs" % (len(vehicles), _state["last_plate"], cd_left),
         "ROI x %.2f-%.2f y %.2f-%.2f" % (ROI_LEFT, ROI_RIGHT, ROI_TOP, ROI_BOTTOM),
     ])
 
-    return {"diag": diag, "vehicles": len(vehicles), "plates": plates}
+    if to_stream:
+        store_web_frame(display)
+
+    return {"diag": diag, "vehicles": len(vehicles), "plates": plates}, display
 
 
 # ---------------------------------------------------------------------------
@@ -561,7 +606,7 @@ def run(model: str) -> None:
             time.sleep(0.05)
             continue
 
-        analyze(image, publish=True, dedup=True)
+        analyze(image, publish=True, dedup=True, to_stream=True)
 
     grabber.release()
 
@@ -573,7 +618,7 @@ def main():
         '--model',
         help='Path to the MediaPipe object-detection model (.tflite).',
         required=False,
-        default='efficientdet_lite0.tflite')
+        default='efficientdet_lite2.tflite')
     parser.add_argument(
         '--image',
         help='Analyze a single local image, print JSON, and exit (offline test).',
@@ -588,7 +633,7 @@ def main():
         if img is None:
             logger.error("Could not read image: %s", args.image)
             sys.exit(1)
-        result = analyze(img, publish=False, dedup=False)
+        result, _ = analyze(img, publish=False, dedup=False, to_stream=False)
         print(json.dumps(result, indent=2))
         return
 
