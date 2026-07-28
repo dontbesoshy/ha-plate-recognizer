@@ -7,6 +7,7 @@ import os
 import re
 import threading
 import logging
+import urllib.request
 
 # fast-alpr / open-image-models download their ONNX weights to a cache dir on
 # first run. Point that cache at /data so it survives addon restarts (HA maps
@@ -57,6 +58,9 @@ else:
         "alpr_on_no_vehicle": os.environ.get("ALPR_ON_NO_VEHICLE", "true"),
         "plate_enhance": os.environ.get("PLATE_ENHANCE", "true"),
         "plate_upscale": float(os.environ.get("PLATE_UPSCALE", "3.0")),
+        "snapshot_on_match": os.environ.get("SNAPSHOT_ON_MATCH", "true"),
+        "plates_select_entity": os.environ.get("PLATES_SELECT_ENTITY", "input_select.plates"),
+        "snapshot_dir": os.environ.get("SNAPSHOT_DIR", "/share/plate_recognizer"),
         "cooldown": float(os.environ.get("COOLDOWN", "30")),
         "analyze_interval": float(os.environ.get("ANALYZE_INTERVAL", "0.4")),
         "enhance_contrast": os.environ.get("ENHANCE_CONTRAST", "false"),
@@ -129,6 +133,15 @@ ALPR_ON_NO_VEHICLE = str(data.get("alpr_on_no_vehicle", True)).lower() in ("true
 PLATE_ENHANCE = str(data.get("plate_enhance", True)).lower() in ("true", "1", "yes", "on")
 PLATE_UPSCALE = float(data.get("plate_upscale", 3.0))
 
+# Snapshot-on-match: when a read plate matches an option of a HA input_select,
+# save the annotated frame to SNAPSHOT_DIR for later review. Options are pulled
+# from HA via the Supervisor API (addon) or HA_URL+HA_TOKEN (standalone).
+SNAPSHOT_ON_MATCH = str(data.get("snapshot_on_match", True)).lower() in ("true", "1", "yes", "on")
+PLATES_SELECT_ENTITY = str(data.get("plates_select_entity", "input_select.plates"))
+SNAPSHOT_DIR = str(data.get("snapshot_dir", "/share/plate_recognizer"))
+HA_URL = os.environ.get("HA_URL", "")       # standalone only
+HA_TOKEN = os.environ.get("HA_TOKEN", "")   # standalone only
+
 # Optional CLAHE contrast boost. Helps backlit / uneven-light scenes.
 ENHANCE_CONTRAST = str(data.get("enhance_contrast", False)).lower() in ("true", "1", "yes", "on")
 
@@ -155,6 +168,11 @@ def build_engines(model):
     global DETECTOR, ALPR_ENGINE
     if ALPR is None:
         raise RuntimeError("fast-alpr not installed. Add it to requirements.txt.")
+    if SNAPSHOT_ON_MATCH:
+        try:
+            os.makedirs(SNAPSHOT_DIR, exist_ok=True)
+        except Exception as e:
+            logger.info("snapshot dir create failed: %s", e)
     if DETECTOR is None:
         base_options = python.BaseOptions(model_asset_path=model)
         options = vision.ObjectDetectorOptions(
@@ -466,6 +484,69 @@ def enhance_plate(crop):
 
 
 # ---------------------------------------------------------------------------
+# Snapshot on known-plate match.
+# ---------------------------------------------------------------------------
+def norm_plate(s):
+    """Normalise a plate for comparison: keep only A-Z0-9, uppercase."""
+    return re.sub(r"[^A-Z0-9]", "", (s or "").upper())
+
+
+_known_cache = {"t": 0.0, "set": set()}
+_snapshot_last = {}  # plate -> last snapshot time (dedup)
+
+
+def _fetch_select_options():
+    """Fetch input_select options from HA. Returns list or None on failure."""
+    sup = os.environ.get("SUPERVISOR_TOKEN")
+    if sup:  # running as an addon: use the Supervisor's HA API proxy
+        url = "http://supervisor/core/api/states/" + PLATES_SELECT_ENTITY
+        token = sup
+    elif HA_URL and HA_TOKEN:  # standalone
+        url = HA_URL.rstrip("/") + "/api/states/" + PLATES_SELECT_ENTITY
+        token = HA_TOKEN
+    else:
+        return None
+    req = urllib.request.Request(url, headers={"Authorization": "Bearer " + token})
+    try:
+        with urllib.request.urlopen(req, timeout=5) as r:
+            d = json.load(r)
+        return d.get("attributes", {}).get("options", []) or []
+    except Exception as e:
+        logger.info("known-plates fetch failed: %s", e)
+        return None
+
+
+def known_plates():
+    """Set of normalised known plates from the HA select (cached ~30 s)."""
+    now = time.time()
+    if now - _known_cache["t"] < 30 and _known_cache["set"]:
+        return _known_cache["set"]
+    opts = _fetch_select_options()
+    if opts is not None:
+        _known_cache["set"] = {norm_plate(o) for o in opts}
+        _known_cache["t"] = now
+    return _known_cache["set"]
+
+
+def save_snapshot(frame_bgr, plate, ts):
+    """Write the annotated frame to SNAPSHOT_DIR (dedup per plate by COOLDOWN)."""
+    if ts - _snapshot_last.get(plate, 0.0) < COOLDOWN:
+        return
+    jpg = encode_jpeg(frame_bgr)
+    if jpg is None:
+        return
+    fn = os.path.join(SNAPSHOT_DIR,
+                      time.strftime("%Y%m%d_%H%M%S") + "_" + norm_plate(plate) + ".jpg")
+    try:
+        with open(fn, "wb") as f:
+            f.write(jpg)
+        _snapshot_last[plate] = ts
+        logger.info("Saved snapshot %s", fn)
+    except Exception as e:
+        logger.info("snapshot write failed: %s", e)
+
+
+# ---------------------------------------------------------------------------
 # Core analysis: ROI + gate + OCR + draw. Shared by the RTSP loop and the web
 # test-upload handler. Returns a JSON-serialisable result dict.
 # ---------------------------------------------------------------------------
@@ -494,6 +575,7 @@ def analyze(image, publish=True, dedup=True, to_stream=True):
     display = image.copy()
     ts = time.time()
     plates = []
+    matched = set()  # read plates that match a HA input_select option
     inset = [None]  # mutable holder for the first plate crop (for the preview)
 
     def ocr_region(x0, y0, region, vclass, vscore):
@@ -549,6 +631,13 @@ def analyze(image, publish=True, dedup=True, to_stream=True):
                 _state["last_plate_ts"] = ts
                 published = True
 
+            # Known-plate match (in the HA input_select) -> flag for snapshot.
+            # An exact match to a known plate is itself a strong signal, so this
+            # does not require the confidence threshold.
+            is_known = SNAPSHOT_ON_MATCH and norm_plate(plate) in known_plates()
+            if is_known:
+                matched.add(plate)
+
             plates.append({
                 "plate": plate,
                 "ocr_confidence": round(ocr_conf, 3),
@@ -556,6 +645,7 @@ def analyze(image, publish=True, dedup=True, to_stream=True):
                 "detect_score": round(float(vscore), 3),
                 "accepted": accepted,
                 "published": published,
+                "known": is_known,
             })
 
     # --- Gate: detect vehicles ---
@@ -615,7 +705,12 @@ def analyze(image, publish=True, dedup=True, to_stream=True):
     if to_stream:
         store_web_frame(display)
 
-    return {"diag": diag, "vehicles": len(vehicles), "plates": plates}, display
+    # Save a snapshot (annotated frame) for each known-plate match.
+    for p in matched:
+        save_snapshot(display, p, ts)
+
+    return {"diag": diag, "vehicles": len(vehicles),
+            "plates": plates, "matched": sorted(matched)}, display
 
 
 # ---------------------------------------------------------------------------

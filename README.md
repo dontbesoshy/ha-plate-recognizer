@@ -43,6 +43,22 @@ Runs fully offline on a Raspberry Pi 5 (`aarch64`) — no cloud API or token req
 | `web_ui` / `web_port` | MJPEG debug preview. | `true` / `8099` |
 | `roi_top/bottom/left/right` | ROI crop as frame fractions (0..1). | full frame |
 
+## Snapshot on known-plate match
+
+If you keep a set of plates in a Home Assistant `input_select` (a dropdown whose
+options are registration strings), the addon can save a snapshot whenever it
+reads one of them. When a read plate matches an option of `plates_select_entity`
+(default `input_select.plates`), the annotated frame is written to
+`snapshot_dir` (default `/share/plate_recognizer`, so `\\<host>\share` or the
+HA media/Samba add-on can browse it). Filenames are `YYYYMMDD_HHMMSS_PLATE.jpg`;
+saves are de-duplicated per plate by `cooldown`.
+
+Options are read live from HA via the Supervisor API (`homeassistant_api: true`),
+so no token is needed as an addon — add/remove plates in the dropdown and the
+addon picks them up within ~30 s. For standalone runs, set `HA_URL` + `HA_TOKEN`
+(a long-lived token). Matching ignores case, spaces and dashes. Set
+`snapshot_on_match: false` to disable.
+
 ## Debug preview
 
 Open `http://<host>:8099` to see a live annotated view: the ROI boundary, vehicle
