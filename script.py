@@ -8,6 +8,7 @@ import re
 import threading
 import logging
 import urllib.request
+from collections import deque
 
 # fast-alpr / open-image-models download their ONNX weights to a cache dir on
 # first run. Point that cache at /data so it survives addon restarts (HA maps
@@ -61,6 +62,9 @@ else:
         "snapshot_on_match": os.environ.get("SNAPSHOT_ON_MATCH", "true"),
         "plates_select_entity": os.environ.get("PLATES_SELECT_ENTITY", "input_select.plates"),
         "snapshot_dir": os.environ.get("SNAPSHOT_DIR", "/share/plate_recognizer"),
+        "direction_filter": os.environ.get("DIRECTION_FILTER", "true"),
+        "entry_direction": os.environ.get("ENTRY_DIRECTION", "down"),
+        "motion_min_px": float(os.environ.get("MOTION_MIN_PX", "30")),
         "cooldown": float(os.environ.get("COOLDOWN", "30")),
         "analyze_interval": float(os.environ.get("ANALYZE_INTERVAL", "0.4")),
         "enhance_contrast": os.environ.get("ENHANCE_CONTRAST", "false"),
@@ -142,6 +146,14 @@ SNAPSHOT_DIR = str(data.get("snapshot_dir", "/share/plate_recognizer"))
 HA_URL = os.environ.get("HA_URL", "")       # standalone only
 HA_TOKEN = os.environ.get("HA_TOKEN", "")   # standalone only
 
+# Direction filter: only publish/snapshot a plate when the car is moving in the
+# "entry" direction, so a car LEAVING (exiting) is ignored. Direction is the
+# motion of the vehicle bbox centroid over the last frames. entry_direction is
+# which way an entering car moves in the frame: down/up/left/right.
+DIRECTION_FILTER = str(data.get("direction_filter", True)).lower() in ("true", "1", "yes", "on")
+ENTRY_DIRECTION = str(data.get("entry_direction", "down")).lower()
+MOTION_MIN_PX = float(data.get("motion_min_px", 30))
+
 # Optional CLAHE contrast boost. Helps backlit / uneven-light scenes.
 ENHANCE_CONTRAST = str(data.get("enhance_contrast", False)).lower() in ("true", "1", "yes", "on")
 
@@ -161,6 +173,28 @@ ALPR_ENGINE = None   # fast-alpr ALPR (plate detect + OCR)
 _clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)) if ENHANCE_CONTRAST else None
 _plate_last_time = {}  # dedup: plate string -> last publish time
 _state = {"last_plate": "-", "last_plate_ts": 0.0, "fps": 0.0, "prev_cycle_t": 0.0}
+
+# Vehicle centroid track for the direction filter: (ts, cx, cy) samples.
+_track = deque(maxlen=12)
+
+
+def track_direction(ts, cx, cy):
+    """Add a centroid sample and classify motion as entry / exit / unknown."""
+    if _track and ts - _track[-1][0] > 2.0:
+        _track.clear()  # new car after a gap
+    _track.append((ts, cx, cy))
+    if len(_track) < 2:
+        return "unknown"
+    t0, x0, y0 = _track[0]
+    t1, x1, y1 = _track[-1]
+    if t1 - t0 < 0.2:
+        return "unknown"
+    dx, dy = x1 - x0, y1 - y0
+    # Signed displacement along the entry axis (positive = entry direction).
+    comp = {"down": dy, "up": -dy, "right": dx, "left": -dx}.get(ENTRY_DIRECTION, dy)
+    if abs(comp) < MOTION_MIN_PX:
+        return "unknown"
+    return "entry" if comp > 0 else "exit"
 
 
 def build_engines(model):
@@ -577,6 +611,7 @@ def analyze(image, publish=True, dedup=True, to_stream=True):
     plates = []
     matched = set()  # read plates that match a HA input_select option
     inset = [None]  # mutable holder for the first plate crop (for the preview)
+    entry_ok = [True]  # mutable: whether this frame's car passes the direction filter
 
     def ocr_region(x0, y0, region, vclass, vscore):
         """Run ALPR on a sub-image at (x0,y0); draw + collect any plates."""
@@ -623,8 +658,9 @@ def analyze(image, publish=True, dedup=True, to_stream=True):
                         cv2.FONT_HERSHEY_DUPLEX, 0.7, (0, 200, 255), 2, cv2.LINE_AA)
 
             accepted = ocr_conf >= MIN_PLATE_CONFIDENCE
+            # Direction filter: skip a car that is not entering (e.g. leaving).
             published = False
-            if accepted and publish and (not dedup or ts - _plate_last_time.get(plate, 0.0) >= COOLDOWN):
+            if accepted and publish and entry_ok[0] and (not dedup or ts - _plate_last_time.get(plate, 0.0) >= COOLDOWN):
                 publish_plate(plate, ocr_conf, vclass, vscore)
                 _plate_last_time[plate] = ts
                 _state["last_plate"] = plate
@@ -633,8 +669,9 @@ def analyze(image, publish=True, dedup=True, to_stream=True):
 
             # Known-plate match (in the HA input_select) -> flag for snapshot.
             # An exact match to a known plate is itself a strong signal, so this
-            # does not require the confidence threshold.
-            is_known = SNAPSHOT_ON_MATCH and norm_plate(plate) in known_plates()
+            # does not require the confidence threshold, but it still respects
+            # the direction filter (don't snapshot a car that is leaving).
+            is_known = SNAPSHOT_ON_MATCH and entry_ok[0] and norm_plate(plate) in known_plates()
             if is_known:
                 matched.add(plate)
 
@@ -652,6 +689,13 @@ def analyze(image, publish=True, dedup=True, to_stream=True):
     rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
     det_result = DETECTOR.detect(mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb))
     vehicles = det_result.detections or []
+
+    # Direction of the primary (largest) vehicle, for the entry/exit filter.
+    direction = "unknown"
+    if vehicles:
+        pb = max(vehicles, key=lambda d: d.bounding_box.width * d.bounding_box.height).bounding_box
+        direction = track_direction(ts, pb.origin_x + pb.width / 2.0, pb.origin_y + pb.height / 2.0)
+    entry_ok[0] = (not DIRECTION_FILTER) or direction == "entry"
 
     for det in vehicles:
         bb = det.bounding_box
@@ -696,9 +740,10 @@ def analyze(image, publish=True, dedup=True, to_stream=True):
             pass
 
     cd_left = max(0.0, COOLDOWN - (ts - _state["last_plate_ts"])) if _state["last_plate"] != "-" else 0.0
+    dir_label = direction if DIRECTION_FILTER else "off"
     display = overlay_status(display, [
         "FPS %.1f  analysis %s  diag %s" % (_state["fps"], "ON" if analysis_enabled else "OFF", diag),
-        "vehicles %d  last plate %s  cooldown %.0fs" % (len(vehicles), _state["last_plate"], cd_left),
+        "vehicles %d  dir %s  last plate %s  cooldown %.0fs" % (len(vehicles), dir_label, _state["last_plate"], cd_left),
         "ROI x %.2f-%.2f y %.2f-%.2f" % (ROI_LEFT, ROI_RIGHT, ROI_TOP, ROI_BOTTOM),
     ])
 
@@ -709,7 +754,7 @@ def analyze(image, publish=True, dedup=True, to_stream=True):
     for p in matched:
         save_snapshot(display, p, ts)
 
-    return {"diag": diag, "vehicles": len(vehicles),
+    return {"diag": diag, "vehicles": len(vehicles), "direction": direction,
             "plates": plates, "matched": sorted(matched)}, display
 
 

@@ -59,6 +59,19 @@ addon picks them up within ~30 s. For standalone runs, set `HA_URL` + `HA_TOKEN`
 (a long-lived token). Matching ignores case, spaces and dashes. Set
 `snapshot_on_match: false` to disable.
 
+## Direction filter (ignore cars leaving)
+
+To avoid reading the plate of a car that is *leaving*, the addon tracks the
+vehicle bbox centroid across frames and only publishes / snapshots when the car
+moves in the "entry" direction. `entry_direction` (down/up/left/right) is which
+way an entering car moves in the frame — with the gate at the bottom and the
+road at the top, an entering car moves **down**, so `entry_direction: down` and
+a leaving car (moving up) is ignored. `motion_min_px` is the minimum centroid
+displacement to decide a direction (below it → `unknown`, which is not treated
+as entry). The preview shows `dir entry/exit/unknown`. Set `direction_filter:
+false` to disable. Note: a single uploaded still has no motion, so it reads as
+`unknown` — the filter needs a moving car across several frames.
+
 ## Debug preview
 
 Open `http://<host>:8099` to see a live annotated view: the ROI boundary, vehicle
