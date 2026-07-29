@@ -107,6 +107,8 @@ NODE_ID = re.sub(r"[^a-z0-9_]+", "_", DEVICE_NAME.lower()).strip("_") or "ha_pla
 DISCOVERY_TOPIC = "homeassistant/sensor/%s/plate/config" % NODE_ID
 STATE_TOPIC = "%s/plate/state" % NODE_ID
 ATTR_TOPIC = "%s/plate/attributes" % NODE_ID
+VEHICLE_DISCOVERY_TOPIC = "homeassistant/binary_sensor/%s/vehicle/config" % NODE_ID
+VEHICLE_STATE_TOPIC = "%s/vehicle/state" % NODE_ID
 
 # Optional region-of-interest crop, fractions of the frame (0..1). Restricts
 # where vehicles are searched -> vehicle is larger after resize -> better
@@ -173,6 +175,7 @@ ALPR_ENGINE = None   # fast-alpr ALPR (plate detect + OCR)
 _clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)) if ENHANCE_CONTRAST else None
 _plate_last_time = {}  # dedup: plate string -> last publish time
 _state = {"last_plate": "-", "last_plate_ts": 0.0, "fps": 0.0, "prev_cycle_t": 0.0}
+_vehicle_present = None  # last published vehicle state (None = not yet published)
 
 # Vehicle centroid track for the direction filter: (ts, cx, cy) samples.
 _track = deque(maxlen=12)
@@ -349,24 +352,38 @@ mqtt_connected = False
 
 
 def publish_discovery(client):
-    """Publish HA MQTT discovery config (retained) so a sensor auto-appears."""
+    """Publish HA MQTT discovery config (retained) so sensors auto-appear."""
     if not MQTT_DISCOVERY:
         return
-    config = {
+    device = {
+        "identifiers": [NODE_ID],
+        "name": DEVICE_NAME,
+        "model": "ha-plate-recognizer",
+        "manufacturer": "ha-plate-recognizer",
+    }
+    plate_config = {
         "name": "Plate",
         "unique_id": "%s_plate" % NODE_ID,
         "state_topic": STATE_TOPIC,
         "json_attributes_topic": ATTR_TOPIC,
         "icon": "mdi:car",
-        "device": {
-            "identifiers": [NODE_ID],
-            "name": DEVICE_NAME,
-            "model": "ha-plate-recognizer",
-            "manufacturer": "ha-plate-recognizer",
-        },
+        "device": device,
     }
-    client.publish(DISCOVERY_TOPIC, json.dumps(config), retain=True)
+    client.publish(DISCOVERY_TOPIC, json.dumps(plate_config), retain=True)
     logger.info("Published HA discovery config to %s", DISCOVERY_TOPIC)
+
+    vehicle_config = {
+        "name": "Vehicle detected",
+        "unique_id": "%s_vehicle" % NODE_ID,
+        "state_topic": VEHICLE_STATE_TOPIC,
+        "payload_on": "ON",
+        "payload_off": "OFF",
+        "device_class": "motion",
+        "icon": "mdi:car-search",
+        "device": device,
+    }
+    client.publish(VEHICLE_DISCOVERY_TOPIC, json.dumps(vehicle_config), retain=True)
+    logger.info("Published HA vehicle discovery config to %s", VEHICLE_DISCOVERY_TOPIC)
 
 
 def on_connect(client, userdata, flags, rc):
@@ -403,6 +420,19 @@ try:
 except Exception as e:
     logger.info("MQTT connect failed (%s); continuing without MQTT", e)
 client.loop_start()
+
+
+def publish_vehicle_state(detected: bool):
+    """Publish vehicle presence ON/OFF; only sends when state changes."""
+    global _vehicle_present
+    if not mqtt_connected:
+        return
+    new_state = "ON" if detected else "OFF"
+    if new_state == _vehicle_present:
+        return
+    _vehicle_present = new_state
+    client.publish(VEHICLE_STATE_TOPIC, new_state, retain=True)
+    logger.info("Vehicle detected: %s", new_state)
 
 
 def publish_plate(plate, ocr_conf, vehicle_class, detect_score):
@@ -689,6 +719,9 @@ def analyze(image, publish=True, dedup=True, to_stream=True):
     rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
     det_result = DETECTOR.detect(mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb))
     vehicles = det_result.detections or []
+
+    if publish:
+        publish_vehicle_state(bool(vehicles))
 
     # Direction of the primary (largest) vehicle, for the entry/exit filter.
     direction = "unknown"
