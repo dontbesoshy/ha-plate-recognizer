@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.2.3
+
+- Filtr minimalnej długości tablicy: rejestracja jest publikowana do MQTT tylko jeśli ma 6 lub więcej znaków (eliminuje fałszywe odczyty krótkich fragmentów)
+
 ## 0.2.2
 
 - Dodano CHANGELOG.md — od teraz widoczny przy każdej aktualizacji w HA

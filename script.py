@@ -687,7 +687,7 @@ def analyze(image, publish=True, dedup=True, to_stream=True):
                         (x0, min(roi_h - 6, y0 + region.shape[0] + 22)),
                         cv2.FONT_HERSHEY_DUPLEX, 0.7, (0, 200, 255), 2, cv2.LINE_AA)
 
-            accepted = ocr_conf >= MIN_PLATE_CONFIDENCE
+            accepted = ocr_conf >= MIN_PLATE_CONFIDENCE and len(plate) >= 6
             # Direction filter: skip a car that is not entering (e.g. leaving).
             published = False
             if accepted and publish and entry_ok[0] and (not dedup or ts - _plate_last_time.get(plate, 0.0) >= COOLDOWN):
