@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.2.4
+
+- Przywrócono nazwę binary sensora: `binary_sensor.ha_plate_recognizer_vehicle_detected`
+
 ## 0.2.3
 
 - Filtr minimalnej długości tablicy: rejestracja jest publikowana do MQTT tylko jeśli ma 6 lub więcej znaków (eliminuje fałszywe odczyty krótkich fragmentów)

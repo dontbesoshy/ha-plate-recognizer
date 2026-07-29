@@ -373,7 +373,7 @@ def publish_discovery(client):
     logger.info("Published HA discovery config to %s", DISCOVERY_TOPIC)
 
     vehicle_config = {
-        "name": "Vehicle",
+        "name": "Vehicle detected",
         "unique_id": "%s_vehicle" % NODE_ID,
         "state_topic": VEHICLE_STATE_TOPIC,
         "payload_on": "ON",
