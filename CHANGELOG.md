@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.2.2
+
+- Dodano CHANGELOG.md — od teraz widoczny przy każdej aktualizacji w HA
+- Poprawka encji binary sensora w dokumentacji automatyzacji (`vehicle_detected` → `vehicle`)
+
 ## 0.2.1
 
 - Poprawka nazwy encji binary sensora pojazdu: `binary_sensor.ha_plate_recognizer_vehicle` (była błędna `vehicle_detected`)
