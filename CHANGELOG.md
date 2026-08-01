@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.2.5
+
+- Zapis zdjęcia przy wykryciu pojazdu (nawet bez dopasowania tablicy) — plik `YYYYMMDD_HHMMSS_vehicle_detected.jpg` w `snapshot_dir`, z cooldownem jak przy tablicach
+
 ## 0.2.4
 
 - Przywrócono nazwę binary sensora: `binary_sensor.ha_plate_recognizer_vehicle_detected`
