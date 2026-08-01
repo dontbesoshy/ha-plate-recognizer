@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.2.6
+
+- Nowa opcja `primary_vehicle_only` (domyślnie `true`) — OCR tylko na największym pojeździe w kadrze; przejeżdżające obok auta są rysowane szarą ramką ale ignorowane przez rozpoznawanie tablic
+- Nowa opcja `min_vehicle_size` (domyślnie `0.05`) — pojazd musi zajmować min. 5% kadru żeby być rozpoznany; odfiltrowane auta w tle
+
 ## 0.2.5
 
 - Zapis zdjęcia przy wykryciu pojazdu (nawet bez dopasowania tablicy) — plik `YYYYMMDD_HHMMSS_vehicle_detected.jpg` w `snapshot_dir`, z cooldownem jak przy tablicach

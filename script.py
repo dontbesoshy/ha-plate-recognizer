@@ -124,6 +124,12 @@ ROI_ENABLED = (ROI_TOP, ROI_BOTTOM, ROI_LEFT, ROI_RIGHT) != (0.0, 1.0, 0.0, 1.0)
 MIN_CAR_SCORE = float(data.get("min_car_score", 0.4))
 DETECT_CLASSES = [c.strip() for c in str(data.get("detect_classes", "car,truck,bus,motorcycle")).split(",") if c.strip()]
 
+# Only run OCR on the largest detected vehicle (ignores smaller passing cars).
+PRIMARY_VEHICLE_ONLY = str(data.get("primary_vehicle_only", True)).lower() in ("true", "1", "yes", "on")
+# Minimum vehicle bounding-box area as a fraction of the ROI (0..1). Vehicles
+# smaller than this are drawn but not OCR'd (e.g. distant passing cars).
+MIN_VEHICLE_SIZE = float(data.get("min_vehicle_size", 0.05))
+
 # ALPR: minimum OCR confidence to accept a plate, and cooldown (seconds) before
 # the same plate is published again.
 MIN_PLATE_CONFIDENCE = float(data.get("min_plate_confidence", 0.5))
@@ -753,6 +759,18 @@ def analyze(image, publish=True, dedup=True, to_stream=True):
         direction = track_direction(ts, pb.origin_x + pb.width / 2.0, pb.origin_y + pb.height / 2.0)
     entry_ok[0] = (not DIRECTION_FILTER) or direction == "entry"
 
+    # Determine which vehicles qualify for OCR: must meet min size, and if
+    # primary_vehicle_only is set, only the largest one gets OCR'd. All
+    # detected vehicles are still drawn on the display for diagnostics.
+    roi_area = roi_h * roi_w
+    ocr_candidates = [
+        v for v in vehicles
+        if (v.bounding_box.width * v.bounding_box.height) / roi_area >= MIN_VEHICLE_SIZE
+    ]
+    if PRIMARY_VEHICLE_ONLY and ocr_candidates:
+        ocr_candidates = [max(ocr_candidates, key=lambda d: d.bounding_box.width * d.bounding_box.height)]
+    ocr_set = set(id(v) for v in ocr_candidates)
+
     for det in vehicles:
         bb = det.bounding_box
         x0 = max(0, bb.origin_x)
@@ -760,10 +778,12 @@ def analyze(image, publish=True, dedup=True, to_stream=True):
         x1 = min(roi_w, bb.origin_x + bb.width)
         y1 = min(roi_h, bb.origin_y + bb.height)
         cat = det.categories[0]
-        cv2.rectangle(display, (x0, y0), (x1, y1), (0, 255, 0), 2)
+        is_primary = id(det) in ocr_set
+        color = (0, 255, 0) if is_primary else (128, 128, 128)
+        cv2.rectangle(display, (x0, y0), (x1, y1), color, 2)
         cv2.putText(display, "%s %.2f" % (cat.category_name, cat.score), (x0, max(14, y0 - 6)),
-                    cv2.FONT_HERSHEY_DUPLEX, 0.6, (0, 255, 0), 2, cv2.LINE_AA)
-        if x1 > x0 and y1 > y0:
+                    cv2.FONT_HERSHEY_DUPLEX, 0.6, color, 2, cv2.LINE_AA)
+        if is_primary and x1 > x0 and y1 > y0:
             ocr_region(x0, y0, image[y0:y1, x0:x1], cat.category_name, cat.score)
 
     # Fallback: the gate found nothing but a plate may still be readable (car
