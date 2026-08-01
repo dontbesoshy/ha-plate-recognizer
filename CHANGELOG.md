@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.2.7
+
+- Podwyższono domyślny próg pewności odczytu tablicy `min_plate_confidence` z `0.5` → `0.75` (eliminuje słabe/częściowe odczyty tablic przejeżdżających aut)
+
 ## 0.2.6
 
 - Nowa opcja `primary_vehicle_only` (domyślnie `true`) — OCR tylko na największym pojeździe w kadrze; przejeżdżające obok auta są rysowane szarą ramką ale ignorowane przez rozpoznawanie tablic
