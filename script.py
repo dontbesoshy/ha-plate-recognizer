@@ -182,7 +182,6 @@ _clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)) if ENHANCE_CONTRAST
 _plate_last_time = {}  # dedup: plate string -> last publish time
 _state = {"last_plate": "-", "last_plate_ts": 0.0, "fps": 0.0, "prev_cycle_t": 0.0}
 _vehicle_present = None  # last published vehicle state (None = not yet published)
-_vehicle_snapshot_last = 0.0  # last time a vehicle-detected snapshot was saved
 
 # Vehicle centroid track for the direction filter: (ts, cx, cy) samples.
 _track = deque(maxlen=12)
@@ -617,26 +616,6 @@ def save_snapshot(frame_bgr, plate, ts):
         logger.info("snapshot write failed: %s", e)
 
 
-def _save_vehicle_snapshot(frame_bgr, ts):
-    """Save a snapshot when a vehicle is detected (cooldown-deduped)."""
-    global _vehicle_snapshot_last
-    if ts - _vehicle_snapshot_last < COOLDOWN:
-        return
-    jpg = encode_jpeg(frame_bgr)
-    if jpg is None:
-        return
-    fn = os.path.join(SNAPSHOT_DIR,
-                      time.strftime("%Y%m%d_%H%M%S") + "_vehicle_detected.jpg")
-    try:
-        os.makedirs(SNAPSHOT_DIR, exist_ok=True)
-        with open(fn, "wb") as f:
-            f.write(jpg)
-        _vehicle_snapshot_last = ts
-        logger.info("Saved vehicle snapshot %s", fn)
-    except Exception as e:
-        logger.info("vehicle snapshot write failed: %s", e)
-
-
 # ---------------------------------------------------------------------------
 # Core analysis: ROI + gate + OCR + draw. Shared by the RTSP loop and the web
 # test-upload handler. Returns a JSON-serialisable result dict.
@@ -749,8 +728,6 @@ def analyze(image, publish=True, dedup=True, to_stream=True):
 
     if publish:
         publish_vehicle_state(bool(vehicles))
-        if vehicles and SNAPSHOT_ON_MATCH:
-            _save_vehicle_snapshot(image, ts)
 
     # Direction of the primary (largest) vehicle, for the entry/exit filter.
     direction = "unknown"

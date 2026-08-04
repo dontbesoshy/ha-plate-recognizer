@@ -1,5 +1,5 @@
 name: "ha-plate-recognizer"
-version: "0.2.7"
+version: "0.2.8"
 image: "ghcr.io/dontbesoshy/ha-plate-recognizer"
 slug: "ha-plate-recognizer"
 description: "Detect vehicles with MediaPipe and read license plates via ALPR, published to Home Assistant over MQTT."

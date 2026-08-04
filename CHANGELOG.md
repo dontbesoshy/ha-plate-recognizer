@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.2.8
+
+- Usunięto automatyczny zapis zdjęć przy wykryciu pojazdu (`vehicle_detected.jpg`) — zajmował za dużo miejsca; snapshoty zapisywane są tylko przy dopasowaniu tablicy do listy
+
 ## 0.2.7
 
 - Podwyższono domyślny próg pewności odczytu tablicy `min_plate_confidence` z `0.5` → `0.75` (eliminuje słabe/częściowe odczyty tablic przejeżdżających aut)
